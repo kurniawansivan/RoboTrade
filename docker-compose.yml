@@ -1,0 +1,46 @@
+version: "3.9"
+services:
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_PASSWORD: botpass
+      POSTGRES_DB: trading
+    volumes:
+      - tsdb_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+volumes:
+  tsdb_data:
+  grafana_data:

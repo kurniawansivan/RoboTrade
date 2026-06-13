@@ -1,0 +1,42 @@
+# Exchange
+ccxt[pro]>=4.3
+
+# Data
+pandas>=2.0
+pandas-ta>=0.4.67b0
+numpy>=1.26
+
+# Database
+psycopg2-binary
+SQLAlchemy>=2.0
+
+# Cache
+redis>=5.0
+
+# Backtesting
+vectorbt>=0.26
+
+# Config
+python-dotenv
+pyyaml
+
+# Alerts
+python-telegram-bot>=20
+
+# Dashboard (optional fallback)
+streamlit>=1.30
+
+# ML (Phase 5)
+xgboost>=2.0
+scikit-learn>=1.4
+
+# RL (Phase 6)
+stable-baselines3>=2.2
+gymnasium>=0.29
+
+# Dev
+black
+ruff
+mypy
+pytest
+pytest-asyncio

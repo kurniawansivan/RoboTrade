@@ -1,0 +1,41 @@
+exchange:
+  name: bitget
+  sandbox: true
+  symbol: BTC/USDT:USDT   # primary / fallback
+  symbols:                  # all symbols to scan concurrently
+    - BTC/USDT:USDT
+    - ETH/USDT:USDT
+    - SOL/USDT:USDT
+    - BNB/USDT:USDT
+    - XRP/USDT:USDT
+  timeframe: 5m
+
+strategy:
+  type: rule_based
+  ema_fast: 20
+  ema_slow: 200
+  rsi_period: 14
+  rsi_overbought: 60
+  rsi_oversold: 40
+  atr_period: 14
+  volume_ma_period: 20
+  adx_threshold: 25     # only trade when ADX > threshold (trending market)
+  # HTF filter: 1h EMA20/50 trend direction (computed in features.py)
+
+risk:
+  risk_per_trade: 0.01
+  max_daily_drawdown: 0.04
+  leverage: 5
+  atr_sl_multiplier: 1.5
+  reward_risk_ratio: 3.0
+  max_open_positions: 3   # max concurrent positions across all symbols
+
+data:
+  candle_cache_size: 400   # must be > ema_slow (200) + indicator warmup (~50)
+  warmup_bars: 50
+
+alerts:
+  telegram_enabled: true
+
+logging:
+  level: INFO

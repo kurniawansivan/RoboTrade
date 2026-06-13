@@ -1,0 +1,36 @@
+# Secrets — NEVER commit
+config/.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Data / models
+data/*.csv
+data/*.parquet
+training/models/
+*.pkl
+*.joblib
+*.pt
+*.zip
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
