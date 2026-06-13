@@ -111,6 +111,10 @@ async def run_ws_loop(
                 if len(candles) < 2:
                     continue
 
+                # Write live price (current open bar) to Redis on every WS tick
+                live_price = float(candles[-1][4])  # index 4 = close of current bar
+                await redis_client.set(f"live_price:{symbol}", str(live_price))
+
                 closed_candles = candles[:-1]
                 df_new = pd.DataFrame(
                     closed_candles,
