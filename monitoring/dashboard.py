@@ -12,6 +12,7 @@ from pathlib import Path
 # Allow imports from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import ccxt
 import pandas as pd
 import redis
 import streamlit as st
@@ -32,6 +33,25 @@ st.set_page_config(
 )
 
 # ── Load config ─────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_public_exchange():
+    """Public ccxt exchange — no API keys needed for ticker data."""
+    return ccxt.bitget()
+
+
+def fetch_ticker_prices(syms: list[str]) -> dict[str, float]:
+    """Fetch current price for each symbol directly from Bitget REST. Always fresh."""
+    exchange = get_public_exchange()
+    prices = {}
+    for sym in syms:
+        try:
+            ticker = exchange.fetch_ticker(sym)
+            prices[sym] = float(ticker["last"])
+        except Exception:
+            prices[sym] = 0.0
+    return prices
+
+
 @st.cache_resource
 def get_config() -> dict:
     with open("config/config.yaml") as f:
@@ -140,33 +160,72 @@ def get_all_indicator_states() -> dict[str, dict]:
 mode_badge = "🟡 SANDBOX" if sandbox else "🔴 LIVE"
 st.title(f"🤖 RoboTrade  {mode_badge}")
 
-# Row 1: key metrics
-balance = get_balance()
-day_start = get_day_start_balance()
-daily_pnl = balance - day_start if day_start > 0 else 0.0
-daily_pnl_pct = (daily_pnl / day_start * 100) if day_start > 0 else 0.0
-positions = get_positions()
-indicator = get_indicator_state()
 
-df_candles = get_candles_from_redis()
-last_price = float(df_candles["close"].iloc[-1]) if not df_candles.empty else 0.0
+@st.fragment(run_every=2)
+def live_price_section() -> None:
+    """Reruns every 2 seconds — only this section, no full page reload."""
+    import time
+    prices = fetch_ticker_prices(symbols)
+    bal = get_balance()
+    day_s = get_day_start_balance()
+    pnl = bal - day_s if day_s > 0 else 0.0
+    pnl_pct = (pnl / day_s * 100) if day_s > 0 else 0.0
+    pos = get_positions()
+    btc_px = prices.get(symbol, 0.0)
+    dd = ((day_s - bal) / day_s * 100) if day_s > 0 else 0.0
 
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    st.metric("BTC/USDT", f"${last_price:,.2f}")
-with col2:
-    st.metric("Balance (USDT)", f"${balance:,.2f}")
-with col3:
-    pnl_color = "normal" if daily_pnl >= 0 else "inverse"
-    st.metric("Daily P&L", f"${daily_pnl:+.2f}", f"{daily_pnl_pct:+.2f}%", delta_color=pnl_color)
-with col4:
-    st.metric("Open Positions", len(positions))
-with col5:
-    drawdown_pct = ((day_start - balance) / day_start * 100) if day_start > 0 else 0.0
-    dd_color = "inverse" if drawdown_pct > 2 else "normal"
-    st.metric("Daily DD", f"{drawdown_pct:.2f}%", delta_color=dd_color)
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("BTC/USDT", f"${btc_px:,.2f}")
+    with col2:
+        st.metric("Balance (USDT)", f"${bal:,.2f}")
+    with col3:
+        st.metric("Daily P&L", f"${pnl:+.2f}", f"{pnl_pct:+.2f}%",
+                  delta_color="normal" if pnl >= 0 else "inverse")
+    with col4:
+        st.metric("Open Positions", len(pos))
+    with col5:
+        st.metric("Daily DD", f"{dd:.2f}%",
+                  delta_color="inverse" if dd > 2 else "normal")
+
+    # Symbol scanner — also updates every 2s
+    st.divider()
+    st.subheader("🔭 Symbol Scanner")
+    all_states = get_all_indicator_states()
+    if all_states:
+        rows = []
+        for sym, state in all_states.items():
+            htf = state.get("htf_trend", 0)
+            htf_label = "🟢 Bull" if htf == 1 else ("🔴 Bear" if htf == -1 else "⚪ Neutral")
+            sig = state.get("signal", "none")
+            sig_display = f"🟢 {sig.upper()}" if sig == "long" else (
+                f"🔴 {sig.upper()}" if sig == "short" else "—")
+            live_px = prices.get(sym, state.get("price", 0))
+            rows.append({
+                "Symbol": sym.split("/")[0],
+                "Price": f"${live_px:,.4f}",
+                "Signal": sig_display,
+                "RSI": f"{state.get('rsi', 0):.1f}",
+                "MACD Hist": f"{state.get('macd_hist', 0):.4f}",
+                "1h Trend": htf_label,
+                "Last Bar": state.get("bar_ts", "—")[:19],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Waiting for symbol data… (bot must be running)")
+    st.caption(f"⚡ Live prices — updated every 2s via Bitget REST")
+
+
+live_price_section()
 
 st.divider()
+
+# Static data (indicators, chart, trades) — full page refresh handles these
+balance = get_balance()
+day_start = get_day_start_balance()
+positions = get_positions()
+indicator = get_indicator_state()
+df_candles = get_candles_from_redis()
 
 # Row 2: Signal + Indicators + Position
 col_sig, col_ind, col_pos = st.columns([1, 2, 2])
@@ -236,26 +295,6 @@ st.divider()
 # Row 2.5: Multi-symbol scanner
 st.subheader("🔭 Symbol Scanner")
 all_states = get_all_indicator_states()
-if all_states:
-    rows = []
-    for sym, state in all_states.items():
-        htf = state.get("htf_trend", 0)
-        htf_label = "🟢 Bull" if htf == 1 else ("🔴 Bear" if htf == -1 else "⚪ Neutral")
-        sig = state.get("signal", "none")
-        sig_display = f"🟢 {sig.upper()}" if sig == "long" else (f"🔴 {sig.upper()}" if sig == "short" else "—")
-        rows.append({
-            "Symbol": sym.split("/")[0],
-            "Price": f"${state.get('price', 0):,.4f}",
-            "Signal": sig_display,
-            "RSI": f"{state.get('rsi', 0):.1f}",
-            "MACD Hist": f"{state.get('macd_hist', 0):.4f}",
-            "1h Trend": htf_label,
-            "Last Bar": state.get("bar_ts", "—")[:19],
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-else:
-    st.info("Waiting for symbol data… (bot must be running)")
-
 st.divider()
 
 # Row 3: Price chart
@@ -348,10 +387,4 @@ with st.expander("⚙️ Strategy Config"):
             "risk": config.get("risk", {}),
         })
 
-# Auto-refresh
-st.caption(f"Auto-refreshes every 5s  |  Symbol: {symbol}  |  Mode: {'SANDBOX' if sandbox else 'LIVE'}")
-st.markdown("""
-<script>
-setTimeout(function() { window.location.reload(); }, 5000);
-</script>
-""", unsafe_allow_html=True)
+st.caption(f"⚡ Prices update every 2s  |  Chart/trades refresh on page reload  |  Mode: {'SANDBOX' if sandbox else 'LIVE'}")
