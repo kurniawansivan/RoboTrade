@@ -112,23 +112,35 @@ class TestApproveSignal:
         # $0.10 risk / $300 SL distance = 0.00033 BTC < 0.001 min_qty
         assert spec is None
 
-    def test_leverage_hard_capped_at_5x(self, rm):
-        """Even if config says leverage=20, hard cap is 5×."""
+    def test_leverage_env_driven_no_hard_cap(self, rm):
+        """No hard 5× cap — leverage 20× is honored when no max_leverage guard set."""
         cfg = {
-            "risk": {
-                **BASE_CONFIG["risk"],
-                "leverage": 20,  # user tries to set 20×
-            },
+            "risk": {**BASE_CONFIG["risk"], "leverage": 20},
+            "exchange": BASE_CONFIG["exchange"],
+        }
+        # 20× allows larger notional than 5× would — margin check should pass for a
+        # position that would FAIL at 5× but pass at 20×.
+        spec = rm.approve_signal(
+            "long", 100_000.0, 50.0, 1000.0, 1000.0,
+            cfg, min_qty=0.0001, min_notional=1.0,
+        )
+        assert spec is not None
+        # notional/20 must fit in balance; at 5× the same notional would exceed it
+        assert spec.notional / 20 <= 1000.0 * 0.95
+
+    def test_max_leverage_guard_clamps(self, rm):
+        """max_leverage guard clamps an over-set leverage."""
+        cfg = {
+            "risk": {**BASE_CONFIG["risk"], "leverage": 125, "max_leverage": 10},
             "exchange": BASE_CONFIG["exchange"],
         }
         spec = rm.approve_signal(
             "long", 100_000.0, 200.0, 1000.0, 1000.0,
             cfg, min_qty=0.0001, min_notional=1.0,
         )
+        # With guard=10, required margin uses 10× not 125×
         if spec is not None:
-            # Verify margin was calculated with 5× not 20×
-            max_leveraged_notional = 1000.0 * 5  # 5× cap
-            assert spec.notional <= max_leveraged_notional
+            assert spec.notional / 10 <= 1000.0 * 0.95
 
     def test_invalid_signal_rejected(self, rm):
         spec = rm.approve_signal(
@@ -147,6 +159,41 @@ class TestApproveSignal:
             BASE_CONFIG, min_qty=0.0001, min_notional=1.0,
         )
         assert spec is None
+
+    def test_sl_floor_applied_when_atr_tiny(self, rm):
+        """When ATR is tiny, SL distance floors at min_sl_pct of price."""
+        cfg = {
+            "risk": {**BASE_CONFIG["risk"], "min_sl_pct": 0.008, "atr_sl_multiplier": 2.0},
+            "exchange": BASE_CONFIG["exchange"],
+        }
+        price = 100_000.0
+        spec = rm.approve_signal(
+            "long", price, atr=1.0, balance=1000.0, day_start_balance=1000.0,
+            config=cfg, min_qty=0.0001, min_notional=1.0,
+        )
+        assert spec is not None
+        sl_dist = price - spec.sl
+        # ATR*2 = 2 would be tiny; floor 0.8% of 100k = 800
+        assert abs(sl_dist - price * 0.008) < 1.0
+
+    def test_low_price_asset_precision_preserved(self, rm):
+        """SL/TP for a ~$1 asset keep precision (not rounded to 2 dp)."""
+        cfg = {
+            "risk": {**BASE_CONFIG["risk"], "min_sl_pct": 0.008, "reward_risk_ratio": 2.0},
+            "exchange": BASE_CONFIG["exchange"],
+        }
+        price = 1.1391
+        spec = rm.approve_signal(
+            "long", price, atr=0.001, balance=1000.0, day_start_balance=1000.0,
+            config=cfg, min_qty=0.0001, min_notional=1.0,
+        )
+        assert spec is not None
+        # SL must be ~0.8% below entry, NOT collapsed to 1.13
+        sl_pct = (price - spec.sl) / price
+        assert 0.007 < sl_pct < 0.009
+        # TP must give ~2:1
+        tp_pct = (spec.tp - price) / price
+        assert abs(tp_pct / sl_pct - 2.0) < 0.1
 
     def test_risk_amount_is_1pct_of_balance(self, rm):
         balance = 500.0

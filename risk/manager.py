@@ -4,7 +4,7 @@ Layer: risk. No DB/order imports — pure calculation.
 
 Hard rules (never bypass):
   - Risk per trade: 1% of balance
-  - Leverage hard cap: 5×
+  - Leverage: from config (env-injected via LEVERAGE). Soft guard: risk.max_leverage (0 = off)
   - Daily drawdown gate: halt if balance < day_start × (1 - max_daily_drawdown)
   - Never return a position without SL and TP
 """
@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 # Below this USD notional we cannot place a position (exchange minimum)
 # Bitget BTCUSDT perp minimum: 0.001 BTC. Set conservatively; fetched from exchange at startup.
 _DEFAULT_MIN_NOTIONAL_USD = 5.0
+
+
+def _round_sig(x: float, sig: int = 6) -> float:
+    """Round to N significant figures — precision-safe across $0.5 alts and $60k BTC."""
+    if x == 0:
+        return 0.0
+    import math
+    return round(x, -int(math.floor(math.log10(abs(x)))) + (sig - 1))
 
 
 @dataclass
@@ -70,8 +78,16 @@ class RiskManager:
         sl_mult: float = risk_cfg["atr_sl_multiplier"]
         rr: float = risk_cfg["reward_risk_ratio"]
 
-        # Hard cap leverage at 5× regardless of config
-        leverage = min(leverage, 5)
+        # Soft sanity guard only (no hard 5× cap). max_leverage=0 disables guard.
+        max_lev: int = int(risk_cfg.get("max_leverage", 0) or 0)
+        if max_lev > 0 and leverage > max_lev:
+            logger.warning(
+                "leverage exceeds max_leverage guard — clamping",
+                extra={"requested": leverage, "max_leverage": max_lev},
+            )
+            leverage = max_lev
+        if leverage <= 0:
+            leverage = 1
 
         # ── Drawdown gate ──────────────────────────────────────────────────
         if day_start_balance > 0:
@@ -94,7 +110,11 @@ class RiskManager:
             return None
 
         # ── SL / TP ────────────────────────────────────────────────────────
-        sl_distance = atr * sl_mult
+        # Stop = max(ATR-based, percentage floor). The floor guarantees the stop
+        # is never tighter than market noise + round-trip fees+slippage, so the
+        # take-profit is always a meaningful multiple of real trading cost.
+        min_sl_pct: float = float(risk_cfg.get("min_sl_pct", 0.0) or 0.0)
+        sl_distance = max(atr * sl_mult, price * min_sl_pct)
         tp_distance = sl_distance * rr
 
         if signal == "long":
@@ -160,11 +180,14 @@ class RiskManager:
             )
             return None
 
+        # Keep full precision here — order_manager applies the exchange's price
+        # precision per symbol. Rounding to 2 dp here would destroy SL/TP on
+        # low-priced assets (e.g. XRP ~$1.14 → 1.13/1.15, breaking the R:R).
         spec = TradeSpec(
             side=side,
             entry=price,
-            sl=round(sl, 2),
-            tp=round(tp, 2),
+            sl=_round_sig(sl),
+            tp=_round_sig(tp),
             qty=qty,
             notional=round(notional, 2),
             risk_usd=round(risk_usd, 4),

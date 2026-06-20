@@ -140,6 +140,33 @@ def get_recent_trades() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+def get_positions_for(sym: str) -> list:
+    raw = r.get(f"positions:{sym.replace('/', '_')}")
+    return json.loads(raw) if raw else []
+
+
+def get_all_open_positions() -> list[dict]:
+    """All open positions across every configured symbol."""
+    out = []
+    for sym in symbols:
+        for p in get_positions_for(sym):
+            p["_symbol"] = sym
+            out.append(p)
+    return out
+
+
+def push_command(action: str, sym: str | None = None) -> None:
+    """Send a command to the bot via Redis (consumed by command_consumer)."""
+    payload = {"action": action}
+    if sym:
+        payload["symbol"] = sym
+    r.lpush("bot:commands", json.dumps(payload))
+
+
+def is_halted() -> bool:
+    return r.get("bot:halted") == "1"
+
+
 def get_indicator_state() -> dict:
     raw = r.get("indicator_state")
     if not raw:
@@ -160,36 +187,82 @@ def get_all_indicator_states() -> dict[str, dict]:
 mode_badge = "🟡 SANDBOX" if sandbox else "🔴 LIVE"
 st.title(f"🤖 RoboTrade  {mode_badge}")
 
+_lev = os.environ.get("LEVERAGE") or config.get("risk", {}).get("leverage", "?")
+_strat = config.get("strategy", {}).get("type", "rule_based")
+_mode = config.get("strategy", {}).get("mode", "")
+_lev_warn = "  ⚠️ HIGH" if str(_lev).isdigit() and int(_lev) > 20 else ""
+st.caption(f"Strategy: **{_strat}** {_mode}  |  Leverage: **{_lev}×**{_lev_warn}  |  Symbols: {len(symbols)}")
+
 
 @st.fragment(run_every=2)
-def live_price_section() -> None:
-    """Reruns every 2 seconds — only this section, no full page reload."""
-    import time
+def control_center() -> None:
+    """Live control center — reruns every 2s. Metrics, positions, manual controls."""
     prices = fetch_ticker_prices(symbols)
     bal = get_balance()
     day_s = get_day_start_balance()
     pnl = bal - day_s if day_s > 0 else 0.0
     pnl_pct = (pnl / day_s * 100) if day_s > 0 else 0.0
-    pos = get_positions()
+    open_pos = get_all_open_positions()
     btc_px = prices.get(symbol, 0.0)
     dd = ((day_s - bal) / day_s * 100) if day_s > 0 else 0.0
+    halted = is_halted()
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("BTC/USDT", f"${btc_px:,.2f}")
-    with col2:
-        st.metric("Balance (USDT)", f"${bal:,.2f}")
-    with col3:
-        st.metric("Daily P&L", f"${pnl:+.2f}", f"{pnl_pct:+.2f}%",
-                  delta_color="normal" if pnl >= 0 else "inverse")
-    with col4:
-        st.metric("Open Positions", len(pos))
-    with col5:
-        st.metric("Daily DD", f"{dd:.2f}%",
-                  delta_color="inverse" if dd > 2 else "normal")
+    # Total unrealized PnL across positions
+    total_upnl = sum(float(p.get("unrealizedPnl") or 0) for p in open_pos)
 
-    # Symbol scanner — also updates every 2s
-    st.divider()
+    # ── Metric row ─────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("BTC/USDT", f"${btc_px:,.2f}")
+    c2.metric("Balance", f"${bal:,.2f}")
+    c3.metric("Daily P&L", f"${pnl:+.2f}", f"{pnl_pct:+.2f}%",
+              delta_color="normal" if pnl >= 0 else "inverse")
+    c4.metric("Unrealized P&L", f"${total_upnl:+.2f}",
+              delta_color="normal" if total_upnl >= 0 else "inverse")
+    c5.metric("Open Positions", len(open_pos))
+    c6.metric("Daily DD", f"{dd:.2f}%", delta_color="inverse" if dd > 2 else "normal")
+
+    # ── Bot controls ─────────────────────────────────────────────────────────
+    status = "🔴 HALTED" if halted else "🟢 TRADING"
+    bc1, bc2, bc3 = st.columns([2, 1, 1])
+    bc1.markdown(f"**Bot status:** {status}")
+    if halted:
+        if bc2.button("▶️ Resume", use_container_width=True):
+            push_command("resume"); st.rerun()
+    else:
+        if bc2.button("⏸️ Halt entries", use_container_width=True):
+            push_command("halt"); st.rerun()
+    if bc3.button("🛑 Flatten ALL", type="primary", use_container_width=True):
+        push_command("flatten_all"); st.toast("Flatten-all sent"); st.rerun()
+
+    # ── Open positions table + per-position close ──────────────────────────
+    st.subheader("💼 Open Positions")
+    if open_pos:
+        for i, p in enumerate(open_pos):
+            sym = p["_symbol"]
+            side = p.get("side", "")
+            contracts = float(p.get("contracts") or 0)
+            entry = float(p.get("entryPrice") or 0)
+            upnl = float(p.get("unrealizedPnl") or 0)
+            mark = prices.get(sym, entry)
+            pct = ((mark - entry) / entry * 100 * (1 if side == "long" else -1)) if entry else 0.0
+            liq = p.get("liquidationPrice")
+            arrow = "🟢 LONG" if side == "long" else "🔴 SHORT"
+
+            pc = st.columns([1.4, 1, 1.4, 1.4, 1.2, 1.2, 1])
+            pc[0].markdown(f"**{sym.split('/')[0]}**  {arrow}")
+            pc[1].markdown(f"{contracts:g}")
+            pc[2].markdown(f"entry ${entry:,.4f}")
+            pc[3].markdown(f"mark ${mark:,.4f}")
+            pc[4].markdown(f"{'🟢' if upnl>=0 else '🔴'} ${upnl:+.2f}")
+            pc[5].markdown(f"{pct:+.2f}%")
+            if pc[6].button("Close", key=f"close_{sym}_{i}", use_container_width=True):
+                push_command("close", sym); st.toast(f"Close {sym} sent"); st.rerun()
+            if liq:
+                st.caption(f"   ↳ {sym.split('/')[0]} liquidation ≈ ${float(liq):,.4f}")
+    else:
+        st.info("No open positions. Bot scanning for signals.")
+
+    # ── Symbol scanner ───────────────────────────────────────────────────────
     st.subheader("🔭 Symbol Scanner")
     all_states = get_all_indicator_states()
     if all_states:
@@ -213,22 +286,19 @@ def live_price_section() -> None:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.info("Waiting for symbol data… (bot must be running)")
-    st.caption(f"⚡ Live prices — updated every 2s via Bitget REST")
+    st.caption("⚡ Live — prices, P&L, positions & controls update every 2s")
 
 
-live_price_section()
+control_center()
 
 st.divider()
 
 # Static data (indicators, chart, trades) — full page refresh handles these
-balance = get_balance()
-day_start = get_day_start_balance()
-positions = get_positions()
 indicator = get_indicator_state()
 df_candles = get_candles_from_redis()
 
-# Row 2: Signal + Indicators + Position
-col_sig, col_ind, col_pos = st.columns([1, 2, 2])
+# Row 2: Signal + Indicators
+col_sig, col_ind = st.columns([1, 2])
 
 with col_sig:
     st.subheader("📡 Signal")
@@ -272,29 +342,6 @@ with col_ind:
     else:
         st.info("Waiting for first candle from bot…")
 
-with col_pos:
-    st.subheader("💼 Open Position")
-    if positions:
-        for pos in positions:
-            side = pos.get("side", "")
-            contracts = pos.get("contracts", 0)
-            entry = pos.get("entryPrice", 0)
-            upnl = pos.get("unrealizedPnl", 0)
-            liq = pos.get("liquidationPrice", "—")
-            color = "🟢" if side == "long" else "🔴"
-            st.markdown(f"**{color} {side.upper()}** | {contracts} contracts @ ${float(entry):,.2f}")
-            pnl_color = "🟢" if float(upnl or 0) >= 0 else "🔴"
-            st.metric("Unrealized P&L", f"${float(upnl or 0):+.2f}")
-            st.write(f"Liquidation: ${float(liq):,.2f}" if liq != "—" else "Liq: —")
-    else:
-        st.info("No open position")
-        st.caption("Bot waits for EMA20/200 crossover + 1h HTF + MACD signal")
-
-st.divider()
-
-# Row 2.5: Multi-symbol scanner
-st.subheader("🔭 Symbol Scanner")
-all_states = get_all_indicator_states()
 st.divider()
 
 # Row 3: Price chart

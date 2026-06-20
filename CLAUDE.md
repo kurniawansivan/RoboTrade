@@ -93,8 +93,10 @@ atr_sl_multiplier: 1.5 | reward_risk_ratio: 2.0
 
 ## Leverage Policy
 Bitget BTC perp default = 20×, max = 125×.
-Bot uses **5× hard cap** until 3 months positive live data.
-Never raise leverage in code without explicit user decision.
+Leverage is **env-driven** via `LEVERAGE` (overrides `config.yaml` risk.leverage). No hard code cap —
+user decision (2026-06). `risk.max_leverage` in config is a soft clamp guard (default 125; 0 = off).
+Set on the exchange per-symbol at startup via `set_leverage`. Recommended ≤5× until 3 months positive live data,
+but NOT enforced in code. Do not re-add a hard 5× cap without explicit user request.
 
 ## Coding Standards
 - **Type hints** on every function signature (`def foo(df: pd.DataFrame) -> str | None:`)

@@ -11,24 +11,36 @@ exchange:
   timeframe: 5m
 
 strategy:
-  type: rule_based
+  type: rule_based      # rule_based | ml
+  mode: trend_align     # fresh_cross | trend_align  (trend_align fires far more often)
   ema_fast: 20
   ema_slow: 200
   rsi_period: 14
-  rsi_overbought: 60
-  rsi_oversold: 40
+  rsi_overbought: 68
+  rsi_oversold: 32
   atr_period: 14
   volume_ma_period: 20
-  adx_threshold: 25     # only trade when ADX > threshold (trending market)
+  adx_threshold: 20     # only trade when 1h ADX > threshold (trending market)
+  signal_cooldown_bars: 6   # min bars between signals per symbol (6×5m = 30min) — prevents spam
+  require_volume: false      # volume filter optional in trend_align mode
   # HTF filter: 1h EMA20/50 trend direction (computed in features.py)
+
+  # ── ML signal (type: ml) ──────────────────────────────────────────────
+  ml:
+    model_path: training/models/xgb_signal.json
+    proba_threshold: 0.55     # min class probability to act on a signal
+    label_lookahead: 6        # bars ahead for label (6×5m = 30min horizon)
+    label_threshold: 0.004    # 0.4% move to label long/short
 
 risk:
   risk_per_trade: 0.01
   max_daily_drawdown: 0.04
-  leverage: 5
-  atr_sl_multiplier: 1.5
-  reward_risk_ratio: 3.0
-  max_open_positions: 3   # max concurrent positions across all symbols
+  leverage: 5             # default; overridden by LEVERAGE env var if set
+  max_leverage: 125       # sanity guard only (Bitget BTC max). 0 = no guard
+  atr_sl_multiplier: 2.0    # SL = 2× ATR (wider — survives 5m noise)
+  min_sl_pct: 0.008         # SL floor: never tighter than 0.8% of price (covers fees+slippage)
+  reward_risk_ratio: 2.0    # TP = 2× SL distance → min ~1.6% target, real edge after costs
+  max_open_positions: 3     # max concurrent positions across all symbols
 
 data:
   candle_cache_size: 400   # must be > ema_slow (200) + indicator warmup (~50)

@@ -279,8 +279,38 @@ Walk-forward MaxDD across all folds: **≤ 1.6%** — capital protected in all m
 | 2 | Rule-based strategy + vectorbt backtest + walk-forward | ✅ Done |
 | 3 | Risk manager + order executor + kill switch + tests | ✅ Done |
 | 4 | Telegram alerts + Streamlit dashboard + multi-symbol | ✅ Done |
-| 5 | XGBoost ML signal with walk-forward CV | 🔜 Next |
+| 5 | XGBoost ML signal + walk-forward trainer | ✅ Done (train + validate before deploying) |
 | 6 | PPO RL agent (Gymnasium env) | 🔜 Planned |
+
+### Machine Learning (Phase 5)
+
+Train an XGBoost direction classifier across all configured symbols:
+
+```bash
+python training/train_ml.py 2023-01-01 2025-01-01
+```
+
+This runs walk-forward CV (train 12m / test 3m), reports out-of-sample **directional accuracy**,
+and saves the model to `training/models/xgb_signal.json`. Only deploy if directional accuracy > 0.50.
+
+To switch the bot to the ML signal, set in `config/config.yaml`:
+
+```yaml
+strategy:
+  type: ml
+  ml:
+    proba_threshold: 0.55   # min class probability to trade
+```
+
+Then restart the bot. The rule-based and ML strategies share the same risk manager, bracket orders, and dashboard.
+
+### Leverage (env-driven)
+
+Leverage is controlled by the `LEVERAGE` env var (overrides `config.yaml`), set on the exchange at startup:
+
+```env
+LEVERAGE=5      # in config/.env — no hard cap; config risk.max_leverage is a soft guard
+```
 
 ---
 
@@ -299,15 +329,20 @@ These are enforced in code and must never be bypassed:
 
 ## Signal Logic
 
-```
-Long entry when ALL conditions met:
-  ✓ EMA20 crosses above EMA200 (fresh 5m crossover)
-  ✓ MACD histogram > 0 (momentum confirming)
-  ✓ RSI < 60 (not overbought)
-  ✓ Volume > 20-bar average
-  ✓ 1h EMA20 > EMA50 (higher-timeframe trend not bearish)
+Two modes (config `strategy.mode`):
 
-Short entry: mirror conditions with inverted filters
+```
+mode: trend_align  (default — active, ~1-10 signals/day/symbol)
+  Long entry when ALL met:
+    ✓ EMA20 > EMA200 on 5m (trend aligned up)
+    ✓ 1h EMA20 ≥ EMA50 (higher-timeframe not bearish)
+    ✓ MACD histogram > 0 (momentum confirming)
+    ✓ RSI < rsi_overbought (not exhausted)
+    ✓ 1h ADX ≥ adx_threshold (market is trending)
+    ✓ cooldown elapsed (signal_cooldown_bars since last signal)
+  Short: mirror with inverted filters
+
+mode: fresh_cross  (rare — original, only on a fresh EMA20/200 crossover)
 
 Exit: ATR-based bracket
   SL = entry ± 1.5 × ATR

@@ -174,7 +174,7 @@ def compute_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
 def label_for_ml(df: pd.DataFrame, lookahead: int = 4, threshold: float = 0.005) -> pd.DataFrame:
     """
-    Add binary label for ML training.
+    Add ternary label for ML training.
     label = 1  if close rises >threshold in next `lookahead` bars
     label = -1 if close falls >threshold
     label = 0  otherwise
@@ -187,3 +187,45 @@ def label_for_ml(df: pd.DataFrame, lookahead: int = 4, threshold: float = 0.005)
     df.loc[future_ret < -threshold, "label"] = -1
     df = df.iloc[:-lookahead].copy()
     return df
+
+
+# Stable feature set used by the ML model — MUST match between training and live.
+ML_FEATURE_COLS: list[str] = [
+    "rsi",
+    "macd_hist",
+    "macd",
+    "adx",
+    "htf_trend",
+    "volume_zscore",
+    "ema_ratio",        # ema_fast / ema_slow - 1
+    "price_vs_slow",    # close / ema_slow - 1
+    "atr_norm",         # atr / close
+    "ret_1", "ret_2", "ret_3", "ret_6", "ret_12",
+    "roll_vol_12",      # rolling std of 1-bar returns
+    "roll_mean_6",      # rolling mean of 1-bar returns
+]
+
+
+def build_ml_features(df_feat: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive the ML feature columns from a compute_features() output.
+    Adds ML_FEATURE_COLS, drops warmup NaNs.
+    Pure transform — no lookahead (all backward-looking).
+    """
+    out = df_feat.copy()
+
+    out["ema_ratio"] = out["ema_fast"] / out["ema_slow"] - 1.0
+    out["price_vs_slow"] = out["close"] / out["ema_slow"] - 1.0
+    out["atr_norm"] = out["atr"] / out["close"]
+
+    ret_1 = out["close"].pct_change()
+    out["ret_1"] = ret_1
+    out["ret_2"] = out["close"].pct_change(2)
+    out["ret_3"] = out["close"].pct_change(3)
+    out["ret_6"] = out["close"].pct_change(6)
+    out["ret_12"] = out["close"].pct_change(12)
+    out["roll_vol_12"] = ret_1.rolling(12).std()
+    out["roll_mean_6"] = ret_1.rolling(6).mean()
+
+    out = out.dropna().reset_index(drop=True)
+    return out

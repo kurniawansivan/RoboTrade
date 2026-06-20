@@ -27,8 +27,9 @@ python-telegram-bot>=20
 streamlit>=1.30
 
 # ML (Phase 5)
-xgboost>=2.0
+xgboost>=2.0          # macOS: also `brew install libomp` (OpenMP runtime)
 scikit-learn>=1.4
+joblib
 
 # RL (Phase 6)
 stable-baselines3>=2.2

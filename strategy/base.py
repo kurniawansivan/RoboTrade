@@ -15,12 +15,15 @@ class Strategy(ABC):
     """
 
     @abstractmethod
-    def generate_signal(self, df: pd.DataFrame, config: dict) -> str | None:
+    def generate_signal(
+        self, df: pd.DataFrame, config: dict, symbol: str | None = None
+    ) -> str | None:
         """
         Args:
             df: Feature DataFrame sorted ascending, all indicators computed.
                 Last row = most recent closed candle.
-            config: Full config dict (strategy section).
+            config: strategy section from config.yaml.
+            symbol: trading symbol (used for per-symbol cooldown state).
 
         Returns:
             'long' | 'short' | None

@@ -19,7 +19,12 @@ from dotenv import load_dotenv
 import ccxt.pro as ccxtpro
 from data.ingestion import run_ws_loop
 from data.storage import build_engine, init_schema
-from execution.order_manager import cancel_all_orders, close_all_positions, place_bracket_order
+from execution.order_manager import (
+    cancel_all_orders,
+    close_all_positions,
+    close_position,
+    place_bracket_order,
+)
 from execution.portfolio import (
     get_all_positions,
     get_balance,
@@ -52,7 +57,23 @@ logger = logging.getLogger(__name__)
 
 def load_config() -> dict:
     with open("config/config.yaml", "r") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    # LEVERAGE env var overrides config (no hard cap — see config risk.max_leverage guard)
+    lev_env = os.environ.get("LEVERAGE")
+    if lev_env:
+        try:
+            cfg["risk"]["leverage"] = int(lev_env)
+        except ValueError:
+            logger.warning("invalid LEVERAGE env value: %s", lev_env)
+    return cfg
+
+
+def _make_strategy(strategy_type: str):
+    """Factory: pick strategy implementation by config type."""
+    if strategy_type == "ml":
+        from strategy.ml_strategy import MLStrategy
+        return MLStrategy()
+    return RuleBasedStrategy()
 
 
 def _build_exchange(config: dict) -> ccxtpro.Exchange:
@@ -105,11 +126,23 @@ async def main() -> None:
     logger.info("initial balance", extra={"balance_usdt": balance, "symbols": symbols, "sandbox": sandbox})
 
     # ── Strategy + Risk ────────────────────────────────────────────────────
-    strategy = RuleBasedStrategy()
+    strategy = _make_strategy(config["strategy"].get("type", "rule_based"))
     risk_manager = RiskManager()
 
-    # Fetch per-symbol exchange limits
+    # Fetch per-symbol exchange limits + set leverage + force one-way position mode
     await exchange.load_markets()
+    leverage = int(config["risk"]["leverage"])
+    if leverage > 20:
+        logger.warning("⚠️  HIGH LEVERAGE: %d× — large losses possible. Set via LEVERAGE env.", leverage)
+
+    # Force one-way (unilateral) position mode account-wide — avoids hedge-mode
+    # order-type mismatch (Bitget error 40774).
+    try:
+        await exchange.set_position_mode(False, symbols[0], params={"productType": "USDT-FUTURES"})
+        logger.info("position mode set to one-way")
+    except Exception as exc:
+        logger.warning("set_position_mode failed (may already be one-way): %s", exc)
+
     sym_limits: dict[str, dict] = {}
     for sym in symbols:
         try:
@@ -120,7 +153,12 @@ async def main() -> None:
             }
         except Exception:
             sym_limits[sym] = {"min_qty": 0.001, "min_notional": 5.0}
-    logger.info("exchange limits loaded", extra={"symbols": list(sym_limits.keys())})
+        # Set leverage on the exchange for this symbol (best-effort)
+        try:
+            await exchange.set_leverage(leverage, sym, params={"productType": "USDT-FUTURES"})
+        except Exception as exc:
+            logger.warning("set_leverage failed for %s: %s", sym, exc)
+    logger.info("exchange ready | symbols=%s leverage=%d×", list(sym_limits.keys()), leverage)
 
     # ── Candle callback (called per symbol) ───────────────────────────────
     import json as _json
@@ -135,7 +173,7 @@ async def main() -> None:
         price = float(last["close"])
 
         # Write per-symbol indicator state to Redis
-        signal_now = strategy.generate_signal(df_features, cfg["strategy"])
+        signal_now = strategy.generate_signal(df_features, cfg["strategy"], symbol=sym)
         indicator_state = {
             "symbol": sym,
             "signal": signal_now or "none",
@@ -165,6 +203,11 @@ async def main() -> None:
         )
 
         if signal_now is None:
+            return
+
+        # ── Halt flag (set from dashboard) blocks new entries ──────────────
+        if await redis_client.get("bot:halted") == "1":
+            logger.info("trading halted — skipping %s entry", sym)
             return
 
         # ── Total position cap across all symbols ──────────────────────────
@@ -211,6 +254,11 @@ async def main() -> None:
             strategy_type=cfg["strategy"]["type"],
         )
         if order:
+            # Store intended protection levels for the software-side stop safety net
+            await redis_client.set(
+                f"protect:{sym.replace('/', '_')}",
+                _json.dumps({"side": spec.side, "sl": spec.sl, "tp": spec.tp, "entry": spec.entry}),
+            )
             await alert_trade_opened(
                 signal=signal_now,
                 side=spec.side,
@@ -221,6 +269,81 @@ async def main() -> None:
                 risk_usd=spec.risk_usd,
                 symbol=sym,
             )
+
+    # ── Multi-symbol position monitor (syncs balance + every symbol's position) ──
+    from execution.portfolio import sync_positions
+
+    async def _enforce_soft_stop(s: str, positions: list) -> None:
+        """Software-side SL/TP backup: close if mark price breaches intended levels."""
+        protect_key = f"protect:{s.replace('/', '_')}"
+        raw = await redis_client.get(protect_key)
+        open_now = [p for p in positions if float(p.get("contracts") or 0) != 0]
+        if not open_now:
+            # position gone (closed by exchange bracket or manually) → clear protect
+            if raw:
+                await redis_client.delete(protect_key)
+            return
+        if not raw:
+            return
+        prot = _json.loads(raw)
+        pos = open_now[0]
+        mark = float(pos.get("markPrice") or pos.get("info", {}).get("markPrice") or 0)
+        if mark <= 0:
+            return
+        side, sl, tp = prot["side"], float(prot["sl"]), float(prot["tp"])
+        hit = None
+        if side == "buy":
+            if mark <= sl: hit = "SL"
+            elif mark >= tp: hit = "TP"
+        else:
+            if mark >= sl: hit = "SL"
+            elif mark <= tp: hit = "TP"
+        if hit:
+            logger.warning("soft-stop %s hit on %s @ %.4f — closing", hit, s, mark)
+            await close_position(exchange, s)
+            await redis_client.delete(protect_key)
+
+    async def multi_monitor() -> None:
+        logger.info("position monitor started (all symbols)")
+        while True:
+            try:
+                await sync_balance(exchange, redis_client, symbols[0])
+                await init_day_start_balance(redis_client)
+                for s in symbols:
+                    positions = await sync_positions(exchange, redis_client, s)
+                    await _enforce_soft_stop(s, positions)
+            except Exception as exc:
+                logger.error("monitor error", exc_info=exc)
+            await asyncio.sleep(5.0)
+
+    # ── Command consumer — executes dashboard commands from Redis ──────────
+    async def command_consumer() -> None:
+        logger.info("command consumer started")
+        while True:
+            try:
+                raw = await redis_client.rpop("bot:commands")
+                if raw:
+                    cmd = _json.loads(raw)
+                    action = cmd.get("action")
+                    sym = cmd.get("symbol")
+                    logger.info("command received: %s %s", action, sym or "")
+                    if action == "close" and sym:
+                        await close_position(exchange, sym)
+                    elif action == "flatten_all":
+                        for s in symbols:
+                            await close_position(exchange, s)
+                    elif action == "halt":
+                        await redis_client.set("bot:halted", "1")
+                        logger.warning("TRADING HALTED via dashboard")
+                    elif action == "resume":
+                        await redis_client.set("bot:halted", "0")
+                        logger.info("trading resumed via dashboard")
+                    await redis_client.set("bot:last_command", raw)
+                else:
+                    await asyncio.sleep(1.0)
+            except Exception as exc:
+                logger.error("command consumer error", exc_info=exc)
+                await asyncio.sleep(1.0)
 
     # ── Signal handlers ────────────────────────────────────────────────────
     loop = asyncio.get_running_loop()
@@ -233,11 +356,10 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _shutdown, sig)
 
-    # ── Start tasks — one WS loop per symbol ──────────────────────────────
-    monitor_task = asyncio.create_task(
-        run_position_monitor(exchange, redis_client, symbols[0], poll_interval_secs=5.0),
-        name="position_monitor",
-    )
+    # ── Start tasks ────────────────────────────────────────────────────────
+    await redis_client.set("bot:halted", "0")  # reset halt on startup
+    monitor_task = asyncio.create_task(multi_monitor(), name="position_monitor")
+    command_task = asyncio.create_task(command_consumer(), name="command_consumer")
     ws_tasks = [
         asyncio.create_task(
             run_ws_loop(
@@ -266,8 +388,9 @@ async def main() -> None:
     for t in ws_tasks:
         t.cancel()
     monitor_task.cancel()
+    command_task.cancel()
 
-    for t in ws_tasks + [monitor_task]:
+    for t in ws_tasks + [monitor_task, command_task]:
         try:
             await t
         except asyncio.CancelledError:
